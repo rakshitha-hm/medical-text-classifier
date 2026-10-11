@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Tools and editors
+.pytest_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data (Kaggle dataset, not redistributed)
+data/
+
+# Training outputs and checkpoints
+outputs/
+
+# Models: ignore everything except the small TF-IDF fallback
+models/*
+!models/tfidf_baseline.joblib
+
+# Test predictions contain note text from the dataset
+reports/day6_test_predictions.csv

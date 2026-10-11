@@ -1,0 +1,5 @@
+model,mode,dim,accuracy,macro_f1,encode_sec
+pubmedbert,chunk,768,0.896,0.8819083644102813,30.3
+pubmedbert,truncate,768,0.868,0.856831712766238,17.9
+minilm,chunk,384,0.876,0.8524130719906645,5.7
+minilm,truncate,384,0.852,0.8364469927394014,2.1

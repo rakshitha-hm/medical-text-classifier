@@ -1,0 +1,10 @@
+services:
+  api:
+    build: .
+    image: medical-text-classifier
+    ports:
+      - "8000:8000"
+    environment:
+      BACKEND: transformer
+    volumes:
+      - ./models/biomedbert:/app/models/biomedbert:ro

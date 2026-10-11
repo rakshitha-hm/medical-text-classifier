@@ -1,0 +1,10 @@
+.venv/
+.git/
+data/
+outputs/
+reports/
+notebooks/
+tests/
+**/__pycache__/
+models/*
+!models/tfidf_baseline.joblib
