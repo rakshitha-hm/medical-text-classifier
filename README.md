@@ -1,32 +1,51 @@
-# Safety Vision API
+# Medical Text Classifier
 
-![CI](https://github.com/rakshitha-hm/safety-vision-api/actions/workflows/ci.yml/badge.svg)
-![Python](https://img.shields.io/badge/python-3.10-blue)
-![YOLO11](https://img.shields.io/badge/model-YOLO11s-purple)
+![CI](https://github.com/rakshitha-hm/medical-text-classifier/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.11-blue)
+![Model](https://img.shields.io/badge/model-BiomedBERT-purple)
 ![FastAPI](https://img.shields.io/badge/API-FastAPI-009688)
-![Docker](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED)
+![Docker](https://img.shields.io/badge/deploy-Docker-2496ED)
 
-An end-to-end computer vision service that detects mask compliance in images, logs every detection to a database, and raises rule-based alerts per location, with a monitoring dashboard on top.
+An end-to-end clinical NLP service that reads a medical transcription note and predicts its medical specialty (12 classes), with a confidence score, the top-3 alternatives and a flag that routes uncertain notes to a human reviewer.
 
-It covers the full lifecycle: data analysis, label cleaning, a controlled ablation study, honest test-set evaluation, error analysis, a REST API, alerting, Docker deployment and CI.
+The project covers the full lifecycle: label cleaning and leakage-safe splitting, a classic TF-IDF baseline, frozen sentence embeddings, transformer fine-tuning, a controlled model comparison, held-out evaluation with bootstrap confidence intervals, threshold tuning, a REST API with a CPU fallback, tests, Docker and CI.
 
-| Detect | Detect |
-| --- | --- |
-| ![without_mask detection](docs/detect_1.png) | ![incorrect mask detection](docs/detect_2.png) |
+```
+POST /predict  {"text": "<an obstetrics note from the test set>", "top_k": 3}
+
+{
+  "specialty": "Obstetrics / Gynecology",
+  "confidence": 0.9977,
+  "needs_review": false,
+  "top_k": [
+    {"label": "Obstetrics / Gynecology", "score": 0.9977},
+    {"label": "Hematology - Oncology", "score": 0.0004},
+    {"label": "Nephrology", "score": 0.0003}
+  ],
+  "backend": "biomedbert",
+  "latency_ms": 9.3
+}
+```
 
 ---
 
 ## Results at a glance
 
-| Metric (held-out test set) | Baseline YOLO11n | Final YOLO11s |
+| Metric (held-out test set, 250 notes) | TF-IDF + SVM | **BiomedBERT (fine-tuned)** |
 | --- | --- | --- |
-| mAP50 (all classes) | 0.819 | **0.880** |
-| mAP50-95 (all classes) | 0.561 | **0.599** |
-| without_mask mAP50 | 0.877 | **0.940** |
-| mask_weared_incorrect mAP50 (3% class) | 0.627 | **0.730** |
-| Inference, RTX 4060 Laptop GPU (warm) | | about 10 ms |
-| End-to-end API latency, GPU (steady load) | | about 12 to 14 ms |
-| Inference in CPU Docker container | | about 130 ms |
+| Macro-F1 | 0.818 | **0.874** |
+| 95% bootstrap CI | 0.752 to 0.865 | 0.827 to 0.913 |
+| Accuracy | 0.820 | **0.852** |
+| Latency per note, CPU | **0.4 ms** | 175 ms |
+| Latency per note, GPU (RTX 4060 Laptop) | n/a | 15 ms |
+
+- BiomedBERT beat the TF-IDF baseline in 97% of paired bootstrap resamples (95% CI of the difference: -0.004 to 0.127): very likely better, not proven at 95% on 250 notes.
+- At a review threshold of 0.95 (chosen on validation), about 5% of notes go to a human and accuracy on auto-accepted notes rises from 0.912 to 0.937.
+
+| | |
+| --- | --- |
+| ![Model comparison](docs/model_comparison.png) | ![Accuracy vs latency](docs/accuracy_vs_latency.png) |
+| ![Confusion matrix](docs/confusion_matrix.png) | ![Review threshold](docs/review_threshold.png) |
 
 ---
 
@@ -34,181 +53,130 @@ It covers the full lifecycle: data analysis, label cleaning, a controlled ablati
 
 ```mermaid
 flowchart LR
-    U[Browser] --> D[Streamlit dashboard :8501]
-    C[Cameras / scripts] --> A
-    D -->|HTTP + JSON| A[FastAPI service :8000]
-    A --> M[YOLO11s detector]
-    A --> R[Alert rules]
-    A --> DB[(SQLite)]
-    R --> DB
+    C[Client] -->|JSON note| A[FastAPI :8000]
+    A --> V[Pydantic validation]
+    V --> S{Backend}
+    S -->|GPU available| B[BiomedBERT]
+    S -->|CPU fallback| T[TF-IDF + Linear SVM]
+    B --> R[Top-k + confidence + needs_review]
+    T --> R
 ```
 
-- **FastAPI** is the single backend: input validation, inference, persistence and alerting. Any client (the dashboard, a script, a camera system) uses the same endpoints.
-- **Streamlit** is a separate frontend that only talks to the API. The API returns box coordinates; the dashboard decides how to draw them.
-- **Docker Compose** runs both as containers on a private network, with the database on a named volume.
+- **`classifier.py`** holds all model logic: backend selection, scoring, top-k and the review flag.
+- **`app.py`** handles HTTP only: validation, the lifespan start-up (model load and warm-up) and response schemas.
+- Configuration comes from environment variables (`BACKEND`, `MODEL_DIR`, `TFIDF_PATH`), so the same code runs locally, in Docker and in tests.
 
 ### Endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/health` | Liveness check and inference device |
-| POST | `/predict` | Upload an image (and a `location`); returns detections, counts, violations, latency and any alerts fired |
-| GET | `/alerts?limit=20` | Most recent alerts |
-| GET | `/stats?location=icu&minutes=60` | Faces, violations and violation rate for a location over a time window |
+| GET | `/health` | Status, active backend, device, number of classes, review threshold |
+| GET | `/classes` | The 12 specialties |
+| POST | `/predict` | `{"text": ..., "top_k": 3}` returns specialty, confidence, top-k, needs_review, backend, latency |
 | GET | `/docs` | Interactive Swagger documentation |
+
+Invalid input (blank or very short text, text over 50,000 characters, `top_k` outside 1 to 12) returns HTTP 422. Note text is never logged.
 
 ---
 
 ## Quick start
 
-The only requirement is [Docker Desktop](https://www.docker.com/products/docker-desktop/).
+Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 
 ```bash
-git clone https://github.com/rakshitha-hm/safety-vision-api.git
-cd safety-vision-api
+git clone https://github.com/rakshitha-hm/medical-text-classifier.git
+cd medical-text-classifier
+docker build -t medical-text-classifier .
+docker run -p 8000:8000 medical-text-classifier
+```
+
+Open http://localhost:8000/docs. The image ships with the TF-IDF model, so it runs on any machine.
+
+**With BiomedBERT:** the fine-tuned weights (about 420 MB) are not stored in git. Train them with `src/finetune.py` (see below) so they are in `models/biomedbert/`, then:
+
+```bash
 docker compose up --build
 ```
 
-Then open:
-
-- Dashboard: http://localhost:8501
-- API docs: http://localhost:8000/docs
-
-The first build takes about 5 minutes. The default image uses CPU PyTorch so it runs on any machine.
-
-Example request:
-
-```bash
-curl -X POST -F "file=@your_image.png" -F "location=ward_1" http://localhost:8000/predict
-```
+Compose mounts `models/biomedbert` read-only and sets `BACKEND=transformer` (about 175 ms per note on CPU).
 
 ---
 
 ## Dataset
 
-[Face Mask Detection (Kaggle)](https://www.kaggle.com/datasets/andrewmvd/face-mask-detection): 853 images, Pascal VOC XML annotations, 3 classes. See the dataset page for its license. The dataset is not included in this repository.
+[Medical Transcriptions (Kaggle)](https://www.kaggle.com/datasets/tboyle10/medicaltranscriptions): 4,999 sample notes from MTSamples, in English. See the dataset page for its license. The data is not included in this repository.
 
-Exploratory analysis ([notebooks/01_explore.ipynb](notebooks/01_explore.ipynb)) shaped every later decision:
+Data preparation ([src/prepare_data.py](src/prepare_data.py)) was the most important step:
 
-| Finding | Decision it drove |
+| Problem found in EDA | Decision |
 | --- | --- |
-| Class split 79.4% / 17.6% / 3.0% (26:1 imbalance) | Track per-class recall and mAP, not accuracy; stratified split |
-| Median face only 18 to 31 px wide | Small-object difficulty; image size tested in ablation |
-| Median 2 faces per image, max 115 | Crowded scenes skew the distribution |
-| 5 annotation files with no faces | Kept as background images to reduce false positives |
+| Some "specialties" are document types (Discharge Summary, SOAP / Progress Notes, Letters, ...) | Removed: they describe the note format, not the specialty |
+| The same note appears under several specialties | Deduplicated before splitting, to prevent train/test leakage |
+| A first rule that resolved duplicates alphabetically silently biased labels (Radiology lost to Neurology) | Replaced by an explicit priority rule: generic classes (Surgery, Radiology, General Medicine) yield to a specific specialty; 319 notes with two specific labels dropped |
+| Long-tail classes with very few notes | Classes under 50 notes removed |
+
+**Result:** 1,665 unique notes, 12 classes, stratified 1,165 / 250 / 250 split, with an assertion that no text appears in two splits.
 
 ---
 
-## Pipeline
+## Modelling journey
 
-1. **Label cleaning and conversion** ([src/prepare_data.py](src/prepare_data.py)): clips out-of-image boxes, drops degenerate boxes, converts Pascal VOC to normalized YOLO format. Verified by drawing converted labels back onto images.
-2. **Stratified split** ([src/split_data.py](src/split_data.py)): 70 / 15 / 15 at image level (no face from one image in two splits), stratified on each image's rarest class, fixed seed, with an assertion that fails on any leakage.
-3. **Training** ([src/train.py](src/train.py)): transfer learning from COCO-pretrained YOLO11, 50 epochs, image size 640.
-4. **Ablation study** ([src/compare_runs.py](src/compare_runs.py)): one change at a time, all compared on the same validation set.
-5. **Final evaluation** ([src/evaluate.py](src/evaluate.py)): model chosen first, then evaluated once on the test set.
-6. **Error analysis** ([src/error_analysis.py](src/error_analysis.py)): IoU matching of every prediction to ground truth.
+Each step changed one thing and was compared on the same validation set; the test set was used once at the end.
 
-### Ablation study (validation set, 18 rare-class faces)
-
-| Run | Change | mAP50 | mAP50-95 | Rare-class recall | Inference (ms) |
-| --- | --- | --- | --- | --- | --- |
-| baseline | YOLO11n, 640 px | 0.805 | 0.557 | 0.444 | 4.8 |
-| oversample | Rare-class images repeated 4x in train | 0.836 | 0.562 | 0.667 | 4.8 |
-| **yolo11s** | **Larger model** | **0.882** | **0.615** | **0.833** | 7.0 |
-| yolo11s + oversample | Both | 0.880 | 0.613 | 0.667 | 7.6 |
-
-- The larger model gave the biggest gain; oversampling helped the small model at no speed cost.
-- The two fixes did not stack, so the simpler setup (YOLO11s alone) was chosen.
-- A 960 px run was interrupted by GPU memory limits and is not reported.
-
-### Test set evaluation
-
-| Model | Class | Precision | Recall | mAP50 | mAP50-95 |
-| --- | --- | --- | --- | --- | --- |
-| baseline | all | 0.837 | 0.775 | 0.819 | 0.561 |
-| final | with_mask | 0.962 | 0.890 | 0.968 | 0.663 |
-| final | without_mask | 0.935 | 0.898 | 0.940 | 0.623 |
-| final | mask_weared_incorrect | 0.817 | 0.556 | 0.730 | 0.510 |
-| final | **all** | **0.905** | **0.781** | **0.880** | **0.599** |
-
-Test mAP50 (0.880) matches validation (0.882), so the model generalizes. The large validation recall gain on the rare class did not transfer to test: with 18 instances, one face moves recall by 5.6 points, and model selection on validation makes its scores optimistic.
-
-### Error analysis (test set, confidence 0.25, IoU 0.5)
-
-| True class | Faces | Correct | Wrong class | Missed |
+| Step | Model | Val macro-F1 | Test macro-F1 | Lesson |
 | --- | --- | --- | --- | --- |
-| with_mask | 501 | 467 (93%) | 4 | 30 |
-| without_mask | 88 | 82 (93%) | 0 | 6 |
-| mask_weared_incorrect | 18 | 11 (61%) | 4 | 3 |
+| Baseline | TF-IDF (1-2 grams) + Linear SVM | 0.874 | 0.818 | A strong, explainable keyword baseline |
+| Frozen embeddings | MiniLM / PubMedBERT + Logistic Regression | 0.852 / **0.882** | | Domain pretraining helps; chunking long notes beats truncation |
+| Fine-tuning | DistilBERT (general domain) | 0.829 | 0.843 | Fine-tuning alone did not beat the baseline |
+| Fine-tuning | **BiomedBERT (biomedical)** | **0.91** | **0.874** | Same settings, only the pretrained model changed: +0.08 macro-F1 |
 
-| Outcome | Median face width |
-| --- | --- |
-| correct | 22.5 px |
-| wrong class | 21.0 px |
-| missed | 12.0 px |
-| false alarm | 9.4 px |
+Key findings:
 
-Two distinct failure modes: **missed detections and false alarms concentrate on tiny faces** (a resolution problem), while **wrong-class errors happen at normal sizes** (an ambiguity problem: a mask below the nose sits between the two other classes). Some false alarms are likely unlabelled background faces.
+- **Domain pretraining mattered more than fine-tuning.** Biomedical models won both frozen and fine-tuned.
+- **Error analysis showed a taxonomy problem.** About half of the baseline's errors were predicted as General Medicine, a catch-all class whose top features are generic exam words. BiomedBERT still scores lowest on it (F1 0.63).
+- **Small-sample noise is real.** TF-IDF and DistilBERT swapped places between validation and test; only large gaps were trusted, and all test scores are reported with bootstrap intervals.
+- **The model is over-confident.** Training loss went almost to zero while validation loss rose after epoch 3, and most remaining errors are made with over 95% confidence, so the review flag catches about a third of them.
 
----
-
-## Alerting
-
-Every prediction, its detections and any alerts are written in a single database transaction. A violation is a `without_mask` or `mask_weared_incorrect` detection.
-
-| Rule | Fires when | Safeguards |
-| --- | --- | --- |
-| `multiple_violations` | 2 or more violations in one image | 10-minute cooldown per location |
-| `high_violation_rate` | More than 20% of faces in the last 60 minutes at a location are violations | Minimum sample size; 10-minute cooldown |
-
-A simulation of 60 test images across three locations ([src/simulate_traffic.py](src/simulate_traffic.py)) fired 5 alerts, with an overall violation rate of 19.8%, matching the dataset's 20.6%. The cooldown suppressed repeat alerts. One rate alert fired on only 13 faces, which identified the minimum sample size as the key setting for false alarms.
-
----
-
-## Engineering notes
-
-- **Latency profiling.** The API first measured about 52 ms per request against a 12 ms benchmark. Profiling each stage showed inference ran on the GPU, and the gap came from the laptop GPU's power states on sporadic requests; under steady load it serves in about 12 to 14 ms.
-- **Configuration by environment variables** (`MODEL_PATH`, `DB_PATH`, `API_URL`), so the same code runs locally, in Docker and in tests.
-- **Docker.** CPU PyTorch keeps the API image at 2.4 GB and portable; the dashboard image (1 GB) has no PyTorch. Requirements are installed before code is copied, so code-only rebuilds take seconds.
-- **Security.** Parameterized SQL queries throughout; input validation returns 400, 415 and 422 instead of server errors.
+See [docs/MODEL_CARD.md](docs/MODEL_CARD.md) for intended use, limitations and ethical considerations.
 
 ---
 
 ## Testing and CI
 
 ```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements-dev.txt
 pytest -v
 ```
 
-- **Unit tests:** VOC to YOLO conversion, box cleaning, violation counting.
-- **Database and rule tests:** each test uses its own temporary database; covers thresholds, cooldown, minimum sample size and per-location independence.
-- **API tests:** FastAPI `TestClient` checks the response contract and every error path, using a generated image (no dataset needed).
-
-GitHub Actions runs the tests on every push and pull request, then builds both Docker images only if the tests pass.
+- 13 tests: softmax, backend selection, top-k ordering, the response contract and 6 invalid-input cases.
+- Tests train a tiny 3-class TF-IDF model on the fly, so they need no GPU, dataset or large model.
+- GitHub Actions runs the tests on every push and pull request, then builds the Docker image only if they pass.
 
 ---
 
-## Local development
+## Reproduce the pipeline
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate            # Windows
-# Install PyTorch first, choosing CUDA or CPU at https://pytorch.org/get-started/locally/
-pip install -r requirements.txt
+.venv\Scripts\activate                     # Windows
+# Install PyTorch first (CUDA or CPU) from https://pytorch.org/get-started/locally/
+pip install -r requirements-dev.txt
+pip install pandas matplotlib sentence-transformers accelerate
 
-python -m uvicorn app:app --app-dir src --reload      # API on :8000
-python -m streamlit run src/dashboard.py              # dashboard on :8501
+python src/prepare_data.py                 # clean, deduplicate, split
+python src/baseline.py                     # TF-IDF baselines
+python src/inspect_baseline.py             # confusion pairs and top words
+python src/embeddings.py                   # frozen embeddings
+python src/finetune.py --model microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext --name biomedbert
+python src/evaluate.py                     # test set, bootstrap CIs, latency
 ```
 
-Reproduce the training pipeline (dataset downloaded into `data/`):
+Run the API locally:
 
 ```bash
-python src/prepare_data.py
-python src/split_data.py
-python src/train.py --model yolo11s.pt --name exp_yolo11s
-python src/evaluate.py
-python src/error_analysis.py
+python -m uvicorn app:app --app-dir src
+python src/client_check.py
 ```
 
 ---
@@ -216,28 +184,22 @@ python src/error_analysis.py
 ## Project structure
 
 ```
-safety-vision-api/
+medical-text-classifier/
 ├── src/
-│   ├── prepare_data.py       # label cleaning, VOC to YOLO
-│   ├── split_data.py         # stratified split, data.yaml
-│   ├── train.py              # training CLI
-│   ├── oversample.py         # rare-class oversampling list
-│   ├── compare_runs.py       # ablation comparison
-│   ├── evaluate.py           # test-set evaluation
-│   ├── error_analysis.py     # IoU matching and failure slicing
-│   ├── detector.py           # model wrapper
+│   ├── prepare_data.py       # cleaning, label rules, dedup, stratified split
+│   ├── baseline.py           # TF-IDF + NB / LR / SVM
+│   ├── inspect_baseline.py   # confusion pairs, top words per class
+│   ├── embeddings.py         # MiniLM / PubMedBERT, truncate vs chunk
+│   ├── finetune.py           # Hugging Face Trainer fine-tuning
+│   ├── evaluate.py           # test set, bootstrap CIs, latency
+│   ├── classifier.py         # model wrapper, backend selection, review flag
 │   ├── app.py                # FastAPI service
-│   ├── database.py           # SQLite schema and queries
-│   ├── alerts.py             # alert rules
-│   ├── dashboard.py          # Streamlit frontend
-│   ├── simulate_traffic.py   # synthetic traffic
-│   └── latency_check.py      # latency client
+│   └── client_check.py       # API smoke test
+├── notebooks/                # EDA, duplicates, results charts
 ├── tests/                    # pytest suite
-├── notebooks/                # EDA, label checks, SQL queries
-├── models/mask_detector.pt   # final YOLO11s weights
-├── docs/                     # screenshots
-├── Dockerfile.api
-├── Dockerfile.dashboard
+├── docs/                     # charts, MODEL_CARD.md
+├── models/tfidf_baseline.joblib
+├── Dockerfile
 ├── docker-compose.yml
 └── .github/workflows/ci.yml
 ```
@@ -246,13 +208,16 @@ safety-vision-api/
 
 ## Limitations and next steps
 
-- Recall on incorrectly worn masks (0.556 on 18 test faces) is the main weakness; more labelled examples of this class are the real fix.
-- Tiny faces under about 12 px are often missed; tiling or higher-resolution input for crowded scenes would help.
-- The default container runs on CPU (about 130 ms per image); a GPU image or an optimized model (ONNX, OpenVINO, quantization) is needed for real-time camera loads.
-- SQLite suits a single node; PostgreSQL would be the choice for many concurrent writers.
+- **Calibration:** add label smoothing and earlier stopping, then temperature scaling, and re-tune the review threshold.
+- **Long notes:** inputs are truncated at 512 tokens; try head + tail truncation, chunk-level pooling or a long-context model.
+- **General Medicine:** revisit the label definition with clinicians, or treat it as a fallback class.
+- **Robustness:** average several seeds and evaluate on a larger, external dataset before any real use.
+- **Serving:** a GPU image or an optimised model (ONNX, quantisation, distillation) for faster CPU inference.
+
+Not for clinical decision-making.
 
 ---
 
 ## Tech stack
 
-Python, OpenCV, Pandas, NumPy, PyTorch, Ultralytics YOLO11, scikit-learn, FastAPI, Uvicorn, SQLite, Streamlit, Docker, Docker Compose, pytest, GitHub Actions.
+Python, pandas, scikit-learn, PyTorch, Hugging Face Transformers, sentence-transformers, FastAPI, Pydantic, Uvicorn, pytest, Docker, Docker Compose, GitHub Actions, matplotlib.
